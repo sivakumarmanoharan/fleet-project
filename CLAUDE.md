@@ -10,20 +10,43 @@ answering three business questions:
 
 All data is synthetic. Describe it as a portfolio project with simulated data, never as real company data.
 
-## Hard constraints (Snowflake free trial)
-- 30-day trial with a limited free credit balance. Never add a credit card.
+## Hard constraints (Snowflake trial account)
+- 30-day trial, **Standard edition**, about $2.00 per credit.
+- Trial started with $360 of free usage; $355.90 left on 2026-09-30.
+- **A credit card is on file**, so usage past the free balance may be billed. The guardrails below are mandatory.
 - Trial accounts have **no external network access**: Snowflake cannot call outside APIs.
   All data is generated locally in Python and pushed in (PUT to internal stage, then COPY INTO).
-- Only running warehouses consume credits.
+- What costs money: running warehouses (credits), serverless features and Cortex AI (credits, not covered by resource monitors),
+  cloud services above 10% of daily compute, and storage. Warehouses are by far the biggest item.
+- Standard edition limits: no materialized views, no masking or row access policies, Time Travel max 1 day.
 
 ### Cost guardrails (set up before anything else)
-- One X-SMALL warehouse, `AUTO_SUSPEND = 60`, `AUTO_RESUME = TRUE`.
-- A resource monitor that suspends the warehouse at a fixed credit quota.
-- Tasks scheduled every 10–15 minutes, not every minute. Suspend tasks when not working.
+- One X-SMALL warehouse `FLEET_WH`: `AUTO_SUSPEND = 60`, `AUTO_RESUME = TRUE`, statement timeout 15 minutes.
+- One **account-level** resource monitor `FLEET_RM` covering all warehouses (details below).
+- A Budget with email alerts for serverless and AI spend, which the resource monitor cannot stop.
+- Daily work runs as role `FLEET_ENGINEER`, not ACCOUNTADMIN. It cannot resize the warehouse or run serverless tasks.
+- Tasks run on `FLEET_WH` (never serverless), every 10–15 minutes, not every minute. Suspend tasks when not working.
+- Every task checks its stream for new data before it runs (`WHEN SYSTEM$STREAM_HAS_DATA(...)`), so it never wakes the warehouse for nothing.
 - Run the live stream only while actively developing, never overnight.
 - Keep data small: ~5 clients, ~200 vehicles, ~2 years of history.
+- No Cortex AI functions in this project: they bill per token and no resource monitor can stop them.
 - Use Snowsight dashboards for visuals (no extra tools).
-- For every task, check its stream for new data before it runs. 
+
+### Resource monitor (decided 2026-09-30)
+- `FLEET_RM`: CREDIT_QUOTA = 40 (about $80 max), FREQUENCY = NEVER (one total cap that never resets).
+- Triggers: notify at 50% and 75%, SUSPEND at 90%, SUSPEND_IMMEDIATE at 100%.
+- Created with `IF NOT EXISTS`, never `OR REPLACE`: replacing it resets the used-credit counter to zero.
+- Raising the quota is a deliberate decision, recorded here with a date.
+
+## Snowflake objects
+| Object | Name | Owner | Notes |
+|---|---|---|---|
+| Resource monitor | `FLEET_RM` | ACCOUNTADMIN | Account level |
+| Warehouse | `FLEET_WH` | SYSADMIN | `FLEET_ENGINEER` has USAGE + OPERATE only |
+| Role | `FLEET_ENGINEER` | — | Rolls up to SYSADMIN |
+| Database | `FLEET_DB` | `FLEET_ENGINEER` | Data retention 1 day |
+| Schemas | `BRONZE`, `SILVER`, `GOLD` | `FLEET_ENGINEER` | Quarantine tables live in `SILVER` |
+| Stage | `FLEET_DB.BRONZE.LANDING` | `FLEET_ENGINEER` | One folder per table, e.g. `@LANDING/telematics_events/` |
 
 ## Architecture
 Python simulator (laptop) → internal stage → BRONZE (raw) → SILVER (clean, validated) → GOLD (business answers) → Snowsight dashboard
@@ -31,9 +54,12 @@ Python simulator (laptop) → internal stage → BRONZE (raw) → SILVER (clean,
 - **Backfill** (`generator/backfill.py`): ~2 years of history for all tables, written as CSV/JSON.
 - **Live stream** (`generator/stream.py`): telematics events every few seconds, micro-batched into small files, PUT + COPY INTO.
 - **Incremental processing**: Snowflake Streams + Tasks move only new rows Bronze → Silver → Gold.
-- **Idempotency**: While ingestion, make sure that the pipeline is landing only the data that has changes and not the data that is duplicated.
--**Handling Bad Data**: For each issue or bad data arriving based on quality checks, quarantine that data with a reason column and make sure after checking that corrected data should be able to add in the right table.
--**Consistency**: The units, classifications and the constant values if used should be consistent everywhere across the pipeline. You can use Kilometers for covering distance and hours for covering time
+- **Idempotency**: Re-running any load or transformation must not create duplicates. Only new or changed data lands;
+  a file or row that was already processed is skipped.
+- **Handling bad data**: Rows that fail a quality check go to a quarantine table in SILVER with a reason column.
+  Once corrected, they can be reprocessed into the right Silver table.
+- **Consistency**: Units, classifications and constants are the same everywhere in the pipeline.
+  Distance in kilometres, time in hours, money in USD, timestamps in UTC. Classifications use one fixed list of allowed values.
 - Telematics lands as JSON in a VARIANT column; Silver uses FLATTEN.
 
 ## Data model
@@ -41,28 +67,30 @@ Python simulator (laptop) → internal stage → BRONZE (raw) → SILVER (clean,
 |---|---|---|---|
 | clients | client_id | — | company, industry (construction, HVAC, electrical), seasonal revenue pattern |
 | vehicles | vehicle_id | client_id | VIN, make, model, year, acquisition cost/date, ownership (owned/leased), **status (active/retired), disposal_date, disposal_price** (both NULL while active) |
-| lease_contracts | contract_id | vehicle_id | term, start date, monthly payment, mileage allowance, residual value, end date |
-| telematics_events (streaming, JSON) | event_id | vehicle_id | event timestamp, odometer, engine hours, fuel level, speed, idle time, diagnostic trouble codes |
+| lease_contracts | contract_id | vehicle_id | term, start date, monthly payment, distance allowance (km), residual value, end date |
+| telematics_events (streaming, JSON) | event_id | vehicle_id | event timestamp, odometer (km), engine hours, fuel level, speed, idle time, diagnostic trouble codes |
 | fuel_transactions | transaction_id | vehicle_id | **transaction timestamp**, fuel card purchases: litres, amount, station |
-| maintenance_events | maintenance_id | vehicle_id | **service timestamp, odometer at service, engine hours at service**, service type, cost, vendor, downtime hours |
-| resale_values | make + model + year + mileage band + month | — | monthly market value by make/model/year/mileage band |
+| maintenance_events | maintenance_id | vehicle_id | **service timestamp, odometer at service (km), engine hours at service**, service type, cost, vendor, downtime hours |
+| resale_values | make + model + year + distance band + month | — | monthly market value by make/model/year/distance band (km) |
 
 - Retired vehicles keep their full history so the replacement backtest can compare the actual disposal date against the modelled best date.
 - Maintenance rows carry the odometer and engine hours at service, so "distance since last service" is a subtraction, not a time-based join to telematics.
-- Snowflake does not enforce primary or foreign keys (only NOT NULL), just like informational constraints in Databricks. Silver must check them itself: rows whose vehicle_id or client_id has no match go to quarantine as orphans.
+- Snowflake does not enforce primary or foreign keys (only NOT NULL), just like informational constraints in Databricks. Silver must check them itself.
 
 ### Deliberate data quality issues (Silver must catch them)
 - Duplicate fuel transactions
 - Missing telematics pings
 - Odometer readings that go backward
-- Values mismatch if there is any classification. For example, if the type is classified as car, truck etc, it should be the same across all classifications. Using an enum to classify would help that.
+- Inconsistent classification values: the same category spelled or cased differently (e.g. `Truck`, `truck`, `TRUCK`).
+  Silver maps them to one fixed list of allowed values; anything not on the list goes to quarantine.
+- Orphan rows: a vehicle_id or client_id with no matching parent row goes to quarantine.
 
 ## Business logic (Gold)
 1. **Maintenance priority score** per vehicle: distance and engine hours since last service,
    active diagnostic codes, fuel efficiency drifting worse than the vehicle's own baseline. Ranked per client.
 2. **Financing candidates**:
    - Client-owned vehicles in good condition with strong resale value → purchase leaseback candidates
-   - Leased vehicles on track to exceed mileage allowance → restructure before overage
+   - Leased vehicles on track to exceed their distance allowance → restructure before overage
    - Leases near end date → renewal or replacement decision
 3. **Replacement timing**: rolling cost per km (fuel + maintenance + depreciation) versus falling resale value;
    flag vehicles past the point where running costs rise faster than resale value falls.
@@ -76,36 +104,27 @@ fleet-project/
 │   ├── backfill.py
 │   └── stream.py
 ├── sql/
-│   ├── 01_setup.sql      # warehouse, resource monitor, database, schemas, stage
+│   ├── 01_setup.sql      # resource monitor, role, warehouse, database, schemas, stage
 │   ├── 02_bronze.sql
-│   ├── 03_silver.sql     # dedup, validation, FLATTEN, streams + tasks
+│   ├── 03_silver.sql     # dedup, validation, quarantine, FLATTEN, streams + tasks
 │   └── 04_gold.sql       # the three business questions
 ├── data/                 # generated files, gitignored
 ├── .env                  # Snowflake credentials, gitignored
+├── .gitignore
 └── README.md
 ```
 
 ## Build order
-1. Setup SQL with cost guardrails
+1. Setup SQL with cost guardrails — written (`sql/01_setup.sql`), run in Snowsight
 2. Backfill generator
 3. Live stream simulator
-4. Silver layer (data quality, FLATTEN, streams + tasks)
+4. Silver layer (data quality, quarantine, FLATTEN, streams + tasks)
 5. Gold layer (three business questions)
 6. Dashboard + README (problem, architecture, findings)
 
 ## Conventions
 - Python 3.9+, libraries: faker, numpy, pandas, snowflake-connector-python, python-dotenv
 - Credentials only in `.env`, never committed. `data/` and `.env` in `.gitignore`.
+- Every SQL script is safe to re-run: `CREATE ... IF NOT EXISTS`, then `ALTER` to re-apply settings.
 - Commit to GitHub after each step so work survives the trial ending.
 - Owner's background: Databricks, Azure Fabric, dbt, Spark. Explain Snowflake concepts by mapping them to Databricks equivalents.
-
-### Resource monitor (decided 2026-09-30)
-- Edition: Standard, about $2.00 per credit.
-- Trial started with $360 of free usage; $355.90 left on 2026-09-30.
-- A credit card is on file, so overage may be billed.
-- One account-level resource monitor covering all warehouses.
-- CREDIT_QUOTA = 40 (about $80 max), FREQUENCY = NEVER.
-- Triggers: notify at 50% and 75%, SUSPEND at 90%, SUSPEND_IMMEDIATE at 100%.
-- A Budget with email alerts for serverless and AI spend, which the monitor can't stop.
-- Raising the quota is a deliberate decision, recorded here with a date.
-- Standard edition: no materialized views, no masking policies, Time Travel max 1 day.
