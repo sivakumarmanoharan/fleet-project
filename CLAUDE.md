@@ -59,23 +59,33 @@ Python simulator (laptop) → internal stage → BRONZE (raw) → SILVER (clean,
 - **Handling bad data**: Rows that fail a quality check go to a quarantine table in SILVER with a reason column.
   Once corrected, they can be reprocessed into the right Silver table.
 - **Consistency**: Units, classifications and constants are the same everywhere in the pipeline.
-  Distance in kilometres, time in hours, money in USD, timestamps in UTC. Classifications use one fixed list of allowed values.
+  Distance in kilometres, time in hours, money in CAD, timestamps in UTC. Classifications use one fixed list of allowed values.
 - Telematics lands as JSON in a VARIANT column; Silver uses FLATTEN.
 
 ## Data model
-| Table | Key | Links to | Contents |
+| Table | Key | Links to | Columns |
 |---|---|---|---|
-| clients | client_id | — | company, industry (construction, HVAC, electrical), seasonal revenue pattern |
-| vehicles | vehicle_id | client_id | VIN, make, model, year, acquisition cost/date, ownership (owned/leased), **status (active/retired), disposal_date, disposal_price** (both NULL while active) |
-| lease_contracts | contract_id | vehicle_id | term, start date, monthly payment, distance allowance (km), residual value, end date |
-| telematics_events (streaming, JSON) | event_id | vehicle_id | event timestamp, odometer (km), engine hours, fuel level, speed, idle time, diagnostic trouble codes |
-| fuel_transactions | transaction_id | vehicle_id | **transaction timestamp**, fuel card purchases: litres, amount, station |
-| maintenance_events | maintenance_id | vehicle_id | **service timestamp, odometer at service (km), engine hours at service**, service type, cost, vendor, downtime hours |
-| resale_values | make + model + year + distance band + month | — | monthly market value by make/model/year/distance band (km) |
+| clients | client_id | — | company_name, industry, city, province, seasonal_pattern, client_since |
+| vehicles | vehicle_id | client_id | vin, make, model, model_year, vehicle_type, fuel_type, ownership, acquisition_date, acquisition_cost_cad, **status, disposal_date, disposal_reason, disposal_price_cad** (disposal columns NULL while active) |
+| lease_contracts | contract_id | vehicle_id | start_date, end_date, term_months, monthly_payment_cad, distance_allowance_km, excess_km_rate_cad, residual_value_cad |
+| telematics_events (streaming, JSON) | event_id | vehicle_id | One JSON record per vehicle per day: device_id, firmware_version, upload_ts and a `readings` array. Each reading: event_id, event_ts, odometer_km, engine_hours, fuel_level_pct, speed_kph, idle_hours, `dtc_codes` array |
+| fuel_transactions | transaction_id | vehicle_id | fuel_card_id, transaction_ts, station_name, station_city, station_province, fuel_type, litres, price_per_litre_cad, amount_cad |
+| maintenance_events | maintenance_id | vehicle_id | service_ts, service_type, **odometer_km, engine_hours** (at service), vendor, cost_cad, downtime_hours, resolved_dtc, description |
+| resale_values | make + model + model_year + distance_band + valuation_month | — | band_min_km, band_max_km, market_value_cad |
+| dtc_codes (reference) | dtc_code | — | description, severity |
+
+Allowed values (Silver maps every variant onto these):
+- industry: CONSTRUCTION, HVAC, ELECTRICAL
+- vehicle_type: PICKUP, VAN, BOX_TRUCK · fuel_type: GASOLINE, DIESEL · ownership: OWNED, LEASED
+- status: ACTIVE, RETIRED · disposal_reason: SOLD, LEASE_RETURN
+- service_type: PREVENTIVE_SERVICE, TIRE_SERVICE, BRAKE_SERVICE, UNPLANNED_REPAIR
+- severity: CRITICAL, MEDIUM, LOW
 
 - Retired vehicles keep their full history so the replacement backtest can compare the actual disposal date against the modelled best date.
 - Maintenance rows carry the odometer and engine hours at service, so "distance since last service" is a subtraction, not a time-based join to telematics.
 - Snowflake does not enforce primary or foreign keys (only NOT NULL), just like informational constraints in Databricks. Silver must check them itself.
+- Telematics pings arrive hourly during a shift (about 07:00–17:00 local) on working days only. No pings on days off is normal, not missing data.
+  A missing ping is a gap of more than about 1.5 hours inside one day's readings.
 
 ### Deliberate data quality issues (Silver must catch them)
 - Duplicate fuel transactions
@@ -84,6 +94,17 @@ Python simulator (laptop) → internal stage → BRONZE (raw) → SILVER (clean,
 - Inconsistent classification values: the same category spelled or cased differently (e.g. `Truck`, `truck`, `TRUCK`).
   Silver maps them to one fixed list of allowed values; anything not on the list goes to quarantine.
 - Orphan rows: a vehicle_id or client_id with no matching parent row goes to quarantine.
+- Every injected issue is logged in `data/backfill/_dq_manifest.csv` (issue type, table, record key).
+  This is the answer key: Silver's quarantine counts are checked against it.
+
+### Backfill generator (`generator/backfill.py`)
+- Simulates each vehicle day by day, so odometer, fuel, faults and maintenance stay consistent.
+- Deterministic: the same `--seed` gives byte-identical files. It deletes and rebuilds `data/backfill/` on every run.
+- Default window 2024-10-01 to 2026-09-30 (exclusive). About 200 vehicles, 640k telematics readings, 35 MB.
+- Hidden per-client behaviour, never written to the output: replacement policy (C002 replaces too early, C003 too late),
+  service discipline (C003 services late), annual km per vehicle. Gold must discover these from the data.
+- Writes `data/backfill/_sim_state.json` with each active vehicle's end state, so `stream.py` continues where the backfill stopped.
+- Files starting with `_` are never uploaded to Snowflake.
 
 ## Business logic (Gold)
 1. **Maintenance priority score** per vehicle: distance and engine hours since last service,
@@ -109,6 +130,9 @@ fleet-project/
 │   ├── 03_silver.sql     # dedup, validation, quarantine, FLATTEN, streams + tasks
 │   └── 04_gold.sql       # the three business questions
 ├── data/                 # generated files, gitignored
+│   └── backfill/<table>/ # one folder per table, same layout as @LANDING/<table>/
+├── requirements.txt
+├── .venv/                # Python virtual environment, gitignored
 ├── .env                  # Snowflake credentials, gitignored
 ├── .gitignore
 └── README.md
@@ -116,14 +140,15 @@ fleet-project/
 
 ## Build order
 1. Setup SQL with cost guardrails — written (`sql/01_setup.sql`), run in Snowsight
-2. Backfill generator
+2. Backfill generator — written and validated (`generator/backfill.py`)
 3. Live stream simulator
 4. Silver layer (data quality, quarantine, FLATTEN, streams + tasks)
 5. Gold layer (three business questions)
 6. Dashboard + README (problem, architecture, findings)
 
 ## Conventions
-- Python 3.9+, libraries: faker, numpy, pandas, snowflake-connector-python, python-dotenv
+- Python 3.9+ in `.venv` (`pip install -r requirements.txt`): faker, numpy, pandas, snowflake-connector-python, python-dotenv, tzdata
+- Column names carry their unit: `_km`, `_hours`, `_cad`, `_pct`, `_litres` or `litres`, `_ts` for UTC timestamps, `_date` for dates.
 - Credentials only in `.env`, never committed. `data/` and `.env` in `.gitignore`.
 - Every SQL script is safe to re-run: `CREATE ... IF NOT EXISTS`, then `ALTER` to re-apply settings.
 - Commit to GitHub after each step so work survives the trial ending.
