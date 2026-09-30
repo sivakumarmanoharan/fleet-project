@@ -12,3 +12,7 @@ venv/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Private keys, wherever they end up
+*.p8
+*.pem

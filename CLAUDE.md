@@ -123,6 +123,7 @@ fleet-project/
 ├── CLAUDE.md
 ├── generator/
 │   ├── backfill.py
+│   ├── snowflake_conn.py # shared connection from .env; run it to test the connection
 │   └── stream.py
 ├── sql/
 │   ├── 01_setup.sql      # resource monitor, role, warehouse, database, schemas, stage
@@ -133,7 +134,8 @@ fleet-project/
 │   └── backfill/<table>/ # one folder per table, same layout as @LANDING/<table>/
 ├── requirements.txt
 ├── .venv/                # Python virtual environment, gitignored
-├── .env                  # Snowflake credentials, gitignored
+├── .env                  # Snowflake settings, gitignored
+├── .env.example          # template for .env, committed
 ├── .gitignore
 └── README.md
 ```
@@ -150,6 +152,8 @@ fleet-project/
 - Python 3.9+ in `.venv` (`pip install -r requirements.txt`): faker, numpy, pandas, snowflake-connector-python, python-dotenv, tzdata
 - Column names carry their unit: `_km`, `_hours`, `_cad`, `_pct`, `_litres` or `litres`, `_ts` for UTC timestamps, `_date` for dates.
 - Credentials only in `.env`, never committed. `data/` and `.env` in `.gitignore`.
+- Python connects with **key-pair authentication** as role `FLEET_ENGINEER`: no password stored, no MFA prompt.
+  The private key lives outside the project (`~/.snowflake/`); `*.p8` and `*.pem` are gitignored as a backstop.
 - Every SQL script is safe to re-run: `CREATE ... IF NOT EXISTS`, then `ALTER` to re-apply settings.
 - Commit to GitHub after each step so work survives the trial ending.
 - Owner's background: Databricks, Azure Fabric, dbt, Spark. Explain Snowflake concepts by mapping them to Databricks equivalents.
