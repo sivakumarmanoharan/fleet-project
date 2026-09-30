@@ -123,11 +123,12 @@ fleet-project/
 ├── CLAUDE.md
 ├── generator/
 │   ├── backfill.py
+│   ├── load_bronze.py    # PUT files to @LANDING, run 02_bronze.sql, suspend warehouse
 │   ├── snowflake_conn.py # shared connection from .env; run it to test the connection
 │   └── stream.py
 ├── sql/
 │   ├── 01_setup.sql      # resource monitor, role, warehouse, database, schemas, stage
-│   ├── 02_bronze.sql
+│   ├── 02_bronze.sql     # file formats, raw TRANSIENT tables (all VARCHAR + source metadata), COPY INTO
 │   ├── 03_silver.sql     # dedup, validation, quarantine, FLATTEN, streams + tasks
 │   └── 04_gold.sql       # the three business questions
 ├── data/                 # generated files, gitignored
@@ -143,6 +144,7 @@ fleet-project/
 ## Build order
 1. Setup SQL with cost guardrails — written (`sql/01_setup.sql`), run in Snowsight
 2. Backfill generator — written and validated (`generator/backfill.py`)
+   - Bronze load — done (`generator/load_bronze.py` + `sql/02_bronze.sql`); row counts match the generator, re-runs load nothing
 3. Live stream simulator
 4. Silver layer (data quality, quarantine, FLATTEN, streams + tasks)
 5. Gold layer (three business questions)
