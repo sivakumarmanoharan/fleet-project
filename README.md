@@ -26,6 +26,7 @@ It answers three business questions for a portfolio of commercial fleets:
   - [Step 6. Generate two years of history](#step-6-generate-two-years-of-history)
   - [Step 7. Load the Bronze layer](#step-7-load-the-bronze-layer)
   - [Step 8. Verify in Snowsight](#step-8-verify-in-snowsight)
+  - [Step 9. Run the live stream](#step-9-run-the-live-stream)
 - [Costs and guardrails](#costs-and-guardrails)
 - [Project structure](#project-structure)
 - [Troubleshooting](#troubleshooting)
@@ -64,8 +65,8 @@ Every injected problem is logged in an answer key, so Silver's results can be ch
 | Snowflake setup with cost guardrails | ✅ Done |
 | Backfill generator, two years of history | ✅ Done |
 | Bronze layer and loader | ✅ Done |
-| Live telematics stream | ⏳ Next |
-| Silver layer: data quality, quarantine, FLATTEN, Streams and Tasks | ⏳ Planned |
+| Live telematics stream | ✅ Done |
+| Silver layer: data quality, quarantine, FLATTEN, Streams and Tasks | ⏳ Next |
 | Gold layer: the three business questions | ⏳ Planned |
 | Snowsight dashboard and findings | ⏳ Planned |
 
@@ -279,6 +280,53 @@ LIMIT 20;
 
 ✔ **Check:** the first query shows several spellings of each vehicle type, and the second shows hourly readings.
 
+### Step 9. Run the live stream
+
+The stream continues every active vehicle from where the backfill ended and sends new telematics into Bronze.
+
+1. Try it locally first. This writes files to `data/stream/` and touches nothing in Snowflake:
+   ```bash
+   python generator/stream.py --no-upload --minutes 1
+   ```
+2. Run a real session. It uploads a small file every minute and loads Bronze every 10 minutes:
+   ```bash
+   python generator/stream.py --minutes 30
+   ```
+3. Stop early at any time with **Ctrl+C**. The stream loads what is left and suspends the warehouse either way.
+
+While it runs, you see one line per upload:
+
+```
+  sim Wed 2026-09-30 12:11 UTC |   44 readings,  45 vehicles on shift | uploaded: telematics_stream_s001_00003.json.gz
+  COPY INTO Bronze: fuel_transactions 2 files, 4 rows, 0 errors; telematics_events 3 files, 131 rows, 0 errors
+```
+
+✔ **Check:** in Snowsight, new rows appear in Bronze with a source file name containing `stream`:
+
+```sql
+SELECT COUNT(*) FROM FLEET_DB.BRONZE.TELEMATICS_EVENTS WHERE _source_file LIKE '%stream%';
+```
+
+**How the stream works**
+
+- **Simulated clock.** Time runs 60 times faster than real time by default, so one real minute is one simulated hour.
+  Nights and weekends are skipped. Stream timestamps can be ahead of today's date.
+- **Continuous timeline.** Each session saves its state and the next one continues from there.
+- **Cheap uploads.** Uploading files needs no warehouse. Only the load every 10 minutes wakes it, about 0.2 credits per streaming hour.
+
+**Options**
+
+| Option | Default | Effect |
+|---|---|---|
+| `--minutes` | `30` | Session length in real minutes. Maximum 180 |
+| `--speed` | `60` | Simulated seconds per real second. Use `1` for real time |
+| `--flush-every` | `60` | Real seconds between uploads |
+| `--copy-every` | `10` | Real minutes between loads into Bronze. Minimum 5 |
+| `--no-upload` | off | Local files only, no Snowflake |
+| `--fresh` | off | Forget the saved state and restart from the end of the backfill |
+
+> ⚠️ Run the stream only while you are working on the project. Never leave it running overnight.
+
 ---
 
 ## Costs and guardrails
@@ -293,6 +341,7 @@ The project is designed to run inside a free trial's credit balance.
 | Resource monitor | 40 credits in total, never resets. Warns at 50% and 75%, suspends at 90%, stops everything at 100% |
 | Working role | `FLEET_ENGINEER` cannot resize the warehouse or run serverless tasks |
 | Loader | Suspends the warehouse as soon as it finishes |
+| Live stream | Stops itself after 30 minutes by default, loads at most every 5 to 10 minutes, then suspends the warehouse |
 
 **Emergency stop.** If spending looks wrong, run this in Snowsight:
 
@@ -310,7 +359,7 @@ fleet-project/
 │   ├── backfill.py           # simulates two years of fleet history
 │   ├── snowflake_conn.py     # shared connection; run it to test the connection
 │   ├── load_bronze.py        # uploads files and loads Bronze
-│   └── stream.py             # live telematics stream (planned)
+│   └── stream.py             # live telematics stream into Bronze
 ├── sql/
 │   ├── 01_setup.sql          # credit cap, role, warehouse, database, stage
 │   ├── 02_bronze.sql         # file formats, raw tables, COPY INTO
@@ -337,6 +386,7 @@ fleet-project/
 | `Private key not found` | The path in `.env` is wrong. Use forward slashes and the full path |
 | `JWT token is invalid` | The public key in Snowflake doesn't match your private key, or the account identifier is wrong. Repeat Step 4, item 6, and check Step 5, item 1 |
 | `ModuleNotFoundError` | The virtual environment isn't active. See Step 2, item 2 |
+| `No backfill state found` when streaming | Run Step 6 first; the stream continues from the backfill |
 | Warehouse suspended and won't resume | The 40-credit cap was reached. Check usage in **Admin → Cost Management** before raising the quota |
 
 ---

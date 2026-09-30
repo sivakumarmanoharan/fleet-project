@@ -85,7 +85,9 @@ Allowed values (Silver maps every variant onto these):
 - Maintenance rows carry the odometer and engine hours at service, so "distance since last service" is a subtraction, not a time-based join to telematics.
 - Snowflake does not enforce primary or foreign keys (only NOT NULL), just like informational constraints in Databricks. Silver must check them itself.
 - Telematics pings arrive hourly during a shift (about 07:00–17:00 local) on working days only. No pings on days off is normal, not missing data.
-  A missing ping is a gap of more than about 1.5 hours inside one day's readings.
+  A missing ping is a gap of more than about 1.5 hours between consecutive readings of the same vehicle on the same local day.
+  **Detect gaps per vehicle and day, never per JSON record**: a backfill record holds a whole day, but a stream record
+  holds only the few readings since the last upload.
 
 ### Deliberate data quality issues (Silver must catch them)
 - Duplicate fuel transactions
@@ -105,6 +107,21 @@ Allowed values (Silver maps every variant onto these):
   service discipline (C003 services late), annual km per vehicle. Gold must discover these from the data.
 - Writes `data/backfill/_sim_state.json` with each active vehicle's end state, so `stream.py` continues where the backfill stopped.
 - Files starting with `_` are never uploaded to Snowflake.
+
+### Live stream (`generator/stream.py`)
+- Continues every active vehicle from `_sim_state.json`: same odometer, fuel, faults and behaviour as the backfill.
+- Runs on a **simulated clock** that starts at the backfill end and moves faster than real time
+  (`--speed 60` = one simulated hour per real minute). Nights and weekends are skipped, so there is always traffic.
+  Stream timestamps can therefore be ahead of the real date; Gold must use the latest data date, not `CURRENT_DATE`.
+- Every 60 real seconds: pending readings go to a small file and are uploaded with PUT. **PUT needs no warehouse.**
+- Every 10 real minutes (minimum 5): COPY INTO loads the new files. This is the only step that wakes the warehouse.
+  The COPY statements are read from `sql/02_bronze.sql`, so there is one definition for backfill and stream.
+- Guardrails: stops itself after `--minutes` (default 30, max 180), then loads what is left and suspends the warehouse.
+  Ctrl+C does the same. About 0.2 credits per streaming hour.
+- Refuels during the stream produce fuel transactions. No maintenance happens during the stream, so faults and overdue services build up.
+- Same injected problems as the backfill (missing pings, odometer glitches), appended to `data/stream/_dq_manifest.csv`.
+- State is saved after every upload in `data/stream/_stream_state.json`; the next session continues the timeline.
+  Regenerating the backfill makes the stream start fresh. `--no-upload` writes local files only.
 
 ## Business logic (Gold)
 1. **Maintenance priority score** per vehicle: distance and engine hours since last service,
@@ -132,7 +149,8 @@ fleet-project/
 │   ├── 03_silver.sql     # dedup, validation, quarantine, FLATTEN, streams + tasks
 │   └── 04_gold.sql       # the three business questions
 ├── data/                 # generated files, gitignored
-│   └── backfill/<table>/ # one folder per table, same layout as @LANDING/<table>/
+│   ├── backfill/<table>/ # one folder per table, same layout as @LANDING/<table>/
+│   └── stream/<table>/   # live stream files, uploaded to the same @LANDING/<table>/ folders
 ├── requirements.txt
 ├── .venv/                # Python virtual environment, gitignored
 ├── .env                  # Snowflake settings, gitignored
@@ -145,7 +163,7 @@ fleet-project/
 1. Setup SQL with cost guardrails — written (`sql/01_setup.sql`), run in Snowsight
 2. Backfill generator — written and validated (`generator/backfill.py`)
    - Bronze load — done (`generator/load_bronze.py` + `sql/02_bronze.sql`); row counts match the generator, re-runs load nothing
-3. Live stream simulator
+3. Live stream simulator — done (`generator/stream.py`); tested end to end, stream rows load into the same Bronze tables
 4. Silver layer (data quality, quarantine, FLATTEN, streams + tasks)
 5. Gold layer (three business questions)
 6. Dashboard + README (problem, architecture, findings)
